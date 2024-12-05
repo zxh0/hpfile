@@ -11,4 +11,5 @@ homepage = "https://github.com/qmdb/hpfile"
 [dependencies]
 anyhow = "1.0.86"
 dashmap = "5.4.0"
+memmap2 = "0.9.5"
 
