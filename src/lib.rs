@@ -33,7 +33,12 @@
 //! function, and will be deleted when this test function exits.
 
 pub mod hpfile;
+pub mod hpfile_mm;
 pub mod utils;
 
 pub use hpfile::{HPFile, PreReader};
 pub use utils::TempDir;
+
+pub mod mmap {
+    pub use crate::hpfile_mm::{HPFile, PreReader};
+}
