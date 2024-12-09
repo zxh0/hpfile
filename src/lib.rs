@@ -36,9 +36,10 @@ pub mod hpfile;
 pub mod hpfile_mm;
 pub mod utils;
 
+#[cfg(not(feature = "mmap"))]
 pub use hpfile::{HPFile, PreReader};
-pub use utils::TempDir;
 
-pub mod mmap {
-    pub use crate::hpfile_mm::{HPFile, PreReader};
-}
+#[cfg(feature = "mmap")]
+pub use hpfile_mm::{HPFile, PreReader};
+
+pub use utils::TempDir;
