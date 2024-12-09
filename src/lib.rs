@@ -33,13 +33,13 @@
 //! function, and will be deleted when this test function exits.
 
 pub mod hpfile;
-pub mod hpfile_mm;
 pub mod utils;
 
-#[cfg(not(feature = "mmap"))]
-pub use hpfile::{HPFile, PreReader};
+pub use hpfile::PreReader;
+pub use utils::TempDir;
 
 #[cfg(feature = "mmap")]
-pub use hpfile_mm::{HPFile, PreReader};
+pub type HPFile = hpfile::HPFile<hpfile::MmapSegment>;
 
-pub use utils::TempDir;
+#[cfg(not(feature = "mmap"))]
+pub type HPFile = hpfile::HPFile<hpfile::FileSegment>;

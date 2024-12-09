@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use memmap2::Mmap;
 use std::{
+    borrow::BorrowMut,
     fs::{self, File},
     io::{self, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
@@ -9,20 +11,89 @@ use std::{
 
 const PRE_READ_BUF_SIZE: usize = 512 * 1024;
 
+pub trait Segment: Sized {
+    fn for_read(file: File) -> io::Result<Self>;
+    fn for_append(file: File) -> Self;
+    fn as_mut_file(&mut self) -> io::Result<&mut File>;
+    fn read_at(&self, buf: &mut [u8], offset: i64, segment_size: i64) -> io::Result<usize>;
+}
+
+#[derive(Debug)]
+pub enum MmapSegment {
+    DiskFile(File),
+    MmapFile(Mmap),
+}
+
+impl Segment for MmapSegment {
+    fn for_read(file: File) -> io::Result<Self> {
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(MmapSegment::MmapFile(mmap))
+    }
+
+    fn for_append(file: File) -> Self {
+        MmapSegment::DiskFile(file)
+    }
+
+    fn as_mut_file(&mut self) -> io::Result<&mut File> {
+        match self {
+            MmapSegment::DiskFile(f) => Ok(f),
+            MmapSegment::MmapFile(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "readonly segment",
+            )),
+        }
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: i64, segment_size: i64) -> io::Result<usize> {
+        match self {
+            MmapSegment::DiskFile(f) => f.read_at(buf, offset as u64),
+            MmapSegment::MmapFile(f) => {
+                let offset = offset as usize;
+                let n = usize::min(segment_size as usize - offset, buf.len());
+                buf[0..n].copy_from_slice(&f[offset..offset + n]);
+                Ok(n)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FileSegment {
+    file: File,
+}
+
+impl Segment for FileSegment {
+    fn for_read(file: File) -> io::Result<Self> {
+        Ok(FileSegment { file })
+    }
+
+    fn for_append(file: File) -> Self {
+        FileSegment { file }
+    }
+
+    fn as_mut_file(&mut self) -> io::Result<&mut File> {
+        Ok(&mut self.file)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: i64, _segment_size: i64) -> io::Result<usize> {
+        self.file.read_at(buf, offset as u64)
+    }
+}
+
 /// Head-prunable file
 #[derive(Debug)]
-pub struct HPFile {
+pub struct HPFile<T: Segment> {
     dir_name: String,  // where we store the small files
     segment_size: i64, // the size of each small file
     buffer_size: i64,  // the write buffer's size
-    file_map: DashMap<i64, File>,
+    file_map: DashMap<i64, T>,
     largest_id: AtomicI64,
     latest_file_size: AtomicI64,
     file_size: AtomicI64,
     file_size_on_disk: AtomicI64,
 }
 
-impl HPFile {
+impl<T: Segment> HPFile<T> {
     /// Create a `HPFile` with a directory. If this directory was used by an old HPFile, the old
     /// HPFile must have the same `segment_size` as this one.
     ///
@@ -39,7 +110,7 @@ impl HPFile {
     /// - `Ok`: A successfully initialized `HPFile`
     /// - `Err`: Encounted some file system error.
     ///
-    pub fn new(wr_buf_size: i64, segment_size: i64, dir_name: String) -> Result<HPFile> {
+    pub fn new(wr_buf_size: i64, segment_size: i64, dir_name: String) -> Result<HPFile<T>> {
         if segment_size % wr_buf_size != 0 {
             return Err(anyhow!(
                 "Invalid segmentSize:{} writeBufferSize:{}",
@@ -66,7 +137,7 @@ impl HPFile {
     }
 
     /// Create an empty `HPFile` that has no function and can only be used as placeholder.
-    pub fn empty() -> HPFile {
+    pub fn empty() -> HPFile<T> {
         HPFile {
             dir_name: "".to_owned(),
             segment_size: 0,
@@ -128,23 +199,24 @@ impl HPFile {
         segment_size: i64,
         id_list: Vec<i64>,
         largest_id: i64,
-    ) -> Result<(DashMap<i64, File>, i64)> {
+    ) -> Result<(DashMap<i64, T>, i64)> {
         let file_map = DashMap::new();
         let mut latest_file_size = 0;
 
         for &id in &id_list {
             let file_name = format!("{}/{}-{}", dir_name, id, segment_size);
-            let file = File::options().read(true).write(true).open(file_name)?;
+            let file = File::options().read(true).open(file_name)?;
             if id == largest_id {
                 latest_file_size = file.metadata()?.len() as i64;
             }
-            file_map.insert(id, file);
+
+            file_map.insert(id, T::for_read(file)?);
         }
 
         if id_list.is_empty() {
             let file_name = format!("{}/{}-{}", &dir_name, 0, segment_size);
             let file = File::create_new(file_name)?;
-            file_map.insert(0, file);
+            file_map.insert(0, T::for_append(file));
         }
 
         Ok((file_map, latest_file_size))
@@ -195,7 +267,7 @@ impl HPFile {
         f.set_len(remaining_size as u64)?;
         f.seek(SeekFrom::End(0))?;
 
-        self.file_map.insert(largest_id, f);
+        self.file_map.insert(largest_id, T::for_append(f));
         self.latest_file_size
             .store(remaining_size, Ordering::SeqCst);
         self.file_size.store(size, Ordering::SeqCst);
@@ -221,9 +293,11 @@ impl HPFile {
         if self.is_empty() {
             return Ok(());
         }
+
         let largest_id = self.largest_id.load(Ordering::SeqCst);
-        let mut opt = self.file_map.get_mut(&largest_id);
-        let mut f = opt.as_mut().unwrap().value();
+        let mut opt = self.file_map.get_mut(&largest_id).unwrap();
+        let f = opt.borrow_mut().as_mut_file()?;
+
         if buffer.len() != 0 {
             f.seek(SeekFrom::End(0)).unwrap();
             f.write(&buffer).unwrap();
@@ -231,7 +305,6 @@ impl HPFile {
                 .fetch_add(buffer.len() as i64, Ordering::SeqCst);
             buffer.clear();
         }
-
         f.sync_all()
     }
 
@@ -258,7 +331,7 @@ impl HPFile {
         let pos = offset % self.segment_size;
         let opt = self.file_map.get(&file_id);
         let f = opt.as_ref().unwrap().value();
-        f.read_at(buf, pos as u64)
+        f.read_at(buf, pos, self.segment_size)
     }
 
     /// Read at most `num_bytes` from file at `offset` to fill `buf`
@@ -299,11 +372,11 @@ impl HPFile {
         let f = opt.as_ref().unwrap().value();
 
         if num_bytes >= PRE_READ_BUF_SIZE || pos + num_bytes as i64 > self.segment_size {
-            return f.read_at(&mut buf[..num_bytes], pos as u64);
+            return f.read_at(&mut buf[..num_bytes], pos, self.segment_size);
         }
 
         pre_reader.fill_slice(file_id, pos, |slice| {
-            f.read_at(slice, pos as u64).map(|n| n as i64)
+            f.read_at(slice, pos, self.segment_size).map(|n| n as i64)
         })?;
 
         if !pre_reader.try_read(file_id, pos, &mut buf[..num_bytes]) {
@@ -322,7 +395,7 @@ impl HPFile {
     /// # Parameters
     ///
     /// - `bz`: the byteslice to append. It cannot be longer than `wr_buf_size` specified
-    ///         in `HPFile::new`.
+    ///         in `HPFile::<MmapSegment>::new`.
     /// - `buffer`: the write buffer. It will never be larger than `wr_buf_size`.
     ///
     /// # Returns
@@ -353,11 +426,12 @@ impl HPFile {
             // flush buffer_size bytes to disk
             split_pos = bz.len() - extra_bytes as usize;
             buffer.extend_from_slice(&bz[0..split_pos]);
-            let mut opt = self.file_map.get_mut(&largest_id);
-            let mut f = opt.as_mut().unwrap().value();
-            if let Err(_) = f.write(&buffer) {
-                panic!("Fail to write file");
-            }
+            // let mut opt = self.file_map.get_mut(&largest_id);
+            // let mut f = opt.as_mut().unwrap().value();
+
+            let mut opt = self.file_map.get_mut(&largest_id).unwrap();
+            let f = opt.borrow_mut().as_mut_file()?;
+            f.write(&buffer)?;
             self.file_size_on_disk
                 .fetch_add(buffer.len() as i64, Ordering::SeqCst);
             buffer.clear();
@@ -382,7 +456,7 @@ impl HPFile {
                 buffer.resize(0, 0);
                 buffer.resize(overflow_byte_count as usize, 0);
             }
-            self.file_map.insert(largest_id, f);
+            self.file_map.insert(largest_id, T::for_append(f));
             self.latest_file_size
                 .store(overflow_byte_count, Ordering::SeqCst);
         }
@@ -458,9 +532,15 @@ impl PreReader {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::TempDir;
-    use std::io::Read;
+    use crate::{PreReader, TempDir};
+    use std::{
+        fs::{self, File},
+        io::Read,
+        io::{Seek, SeekFrom, Write},
+    };
+
+    type HPFile = super::HPFile<super::MmapSegment>;
+    // type HPFile = super::HPFile<super::FileSegment>;
 
     #[test]
     fn test_pre_reader() {
