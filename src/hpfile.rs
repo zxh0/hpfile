@@ -205,12 +205,14 @@ impl<T: Segment> HPFile<T> {
 
         for &id in &id_list {
             let file_name = format!("{}/{}-{}", dir_name, id, segment_size);
-            let file = File::options().read(true).open(file_name)?;
             if id == largest_id {
+                let file = File::options().read(true).write(true).open(file_name)?;
                 latest_file_size = file.metadata()?.len() as i64;
+                file_map.insert(id, T::for_append(file));
+            } else {
+                let file = File::options().read(true).open(file_name)?;
+                file_map.insert(id, T::for_read(file)?);
             }
-
-            file_map.insert(id, T::for_read(file)?);
         }
 
         if id_list.is_empty() {
