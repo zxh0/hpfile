@@ -6,6 +6,8 @@ use std::{
     os::unix::fs::FileExt,
     sync::atomic::{AtomicI64, Ordering},
 };
+use tokio;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const PRE_READ_BUF_SIZE: usize = 512 * 1024;
 
@@ -259,6 +261,17 @@ impl HPFile {
         let opt = self.file_map.get(&file_id);
         let f = opt.as_ref().unwrap().value();
         f.read_at(buf, pos as u64)
+    }
+
+    pub async fn read_at_async(&self, buf: &mut [u8], offset: i64) -> io::Result<usize> {
+        let file_id = offset / self.segment_size;
+        let pos = offset % self.segment_size;
+        let opt = self.file_map.get(&file_id);
+        let std_file = opt.unwrap().value().try_clone()?;
+        let mut tokio_file = tokio::fs::File::from_std(std_file);
+        tokio_file.seek(io::SeekFrom::Start(pos as u64)).await?;
+        let n = tokio_file.read_exact(buf).await?;
+        Ok(n)
     }
 
     /// Read at most `num_bytes` from file at `offset` to fill `buf`
