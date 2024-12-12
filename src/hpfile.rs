@@ -270,7 +270,7 @@ impl HPFile {
         let std_file = opt.unwrap().value().try_clone()?;
         let mut tokio_file = tokio::fs::File::from_std(std_file);
         tokio_file.seek(io::SeekFrom::Start(pos as u64)).await?;
-        let n = tokio_file.read_exact(buf).await?;
+        let n = tokio_file.read(buf).await?;
         Ok(n)
     }
 
