@@ -18,6 +18,7 @@ pub struct HPFile {
     segment_size: i64, // the size of each small file
     buffer_size: i64,  // the write buffer's size
     file_map: DashMap<i64, File>,
+    filename_map: DashMap<i64, String>,
     largest_id: AtomicI64,
     latest_file_size: AtomicI64,
     file_size: AtomicI64,
@@ -51,7 +52,7 @@ impl HPFile {
         }
 
         let (id_list, largest_id) = Self::get_file_ids(&dir_name, segment_size)?;
-        let (file_map, latest_file_size) =
+        let (file_map, filename_map, latest_file_size) =
             Self::load_file_map(&dir_name, segment_size, id_list, largest_id)?;
 
         let file_size = largest_id * segment_size + latest_file_size;
@@ -60,6 +61,7 @@ impl HPFile {
             segment_size: segment_size,
             buffer_size: wr_buf_size,
             file_map,
+            filename_map,
             largest_id: AtomicI64::new(largest_id),
             latest_file_size: AtomicI64::new(latest_file_size),
             file_size: AtomicI64::new(file_size),
@@ -74,6 +76,7 @@ impl HPFile {
             segment_size: 0,
             buffer_size: 0,
             file_map: DashMap::with_capacity(0),
+            filename_map: DashMap::with_capacity(0),
             largest_id: AtomicI64::new(0),
             latest_file_size: AtomicI64::new(0),
             file_size: AtomicI64::new(0),
@@ -130,26 +133,29 @@ impl HPFile {
         segment_size: i64,
         id_list: Vec<i64>,
         largest_id: i64,
-    ) -> Result<(DashMap<i64, File>, i64)> {
+    ) -> Result<(DashMap<i64, File>, DashMap<i64, String>, i64)> {
         let file_map = DashMap::new();
+        let filename_map = DashMap::new();
         let mut latest_file_size = 0;
 
         for &id in &id_list {
             let file_name = format!("{}/{}-{}", dir_name, id, segment_size);
-            let file = File::options().read(true).write(true).open(file_name)?;
+            let file = File::options().read(true).write(true).open(&file_name)?;
             if id == largest_id {
                 latest_file_size = file.metadata()?.len() as i64;
             }
             file_map.insert(id, file);
+            filename_map.insert(id, file_name);
         }
 
         if id_list.is_empty() {
             let file_name = format!("{}/{}-{}", &dir_name, 0, segment_size);
-            let file = File::create_new(file_name)?;
+            let file = File::create_new(&file_name)?;
             file_map.insert(0, file);
+            filename_map.insert(0, file_name);
         }
 
-        Ok((file_map, latest_file_size))
+        Ok((file_map, filename_map, latest_file_size))
     }
 
     /// Returns the size of the virtual large file, including the non-flushed bytes
@@ -193,11 +199,12 @@ impl HPFile {
 
         let remaining_size = size - largest_id * self.segment_size;
         let file_name = format!("{}/{}-{}", self.dir_name, largest_id, self.segment_size);
-        let mut f = File::options().read(true).write(true).open(file_name)?;
+        let mut f = File::options().read(true).write(true).open(&file_name)?;
         f.set_len(remaining_size as u64)?;
         f.seek(SeekFrom::End(0))?;
 
         self.file_map.insert(largest_id, f);
+        self.filename_map.insert(largest_id, file_name);
         self.latest_file_size
             .store(remaining_size, Ordering::SeqCst);
         self.file_size.store(size, Ordering::SeqCst);
@@ -266,9 +273,8 @@ impl HPFile {
     pub async fn read_at_async(&self, buf: &mut [u8], offset: i64) -> io::Result<usize> {
         let file_id = offset / self.segment_size;
         let pos = offset % self.segment_size;
-        let opt = self.file_map.get(&file_id);
-        let std_file = opt.unwrap().value().try_clone()?;
-        let mut tokio_file = tokio::fs::File::from_std(std_file);
+        let opt = self.filename_map.get(&file_id);
+        let mut tokio_file = tokio::fs::File::open(opt.unwrap().value()).await?;
         tokio_file.seek(io::SeekFrom::Start(pos as u64)).await?;
         let n = tokio_file.read(buf).await?;
         Ok(n)
@@ -396,6 +402,7 @@ impl HPFile {
                 buffer.resize(overflow_byte_count as usize, 0);
             }
             self.file_map.insert(largest_id, f);
+            self.filename_map.insert(largest_id, file_name);
             self.latest_file_size
                 .store(overflow_byte_count, Ordering::SeqCst);
         }
